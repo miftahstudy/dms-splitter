@@ -183,18 +183,22 @@ def load_raw_rows(uploaded_file):
     if name.endswith(".csv"):
         df = pd.read_csv(uploaded_file, header=None, dtype=object)
         rows = df.values.tolist()
+        fmts = None
     else:
         wb = openpyxl.load_workbook(uploaded_file, data_only=True)
         ws = wb[wb.sheetnames[0]]
-        rows = [list(r) for r in ws.iter_rows(values_only=True)]
-    return rows
+        rows, fmts = [], []
+        for r in ws.iter_rows():
+            rows.append([c.value for c in r])
+            fmts.append([c.number_format for c in r])  # format tampilan asli (mis. dd/mm/yyyy)
+    return rows, fmts
 
 
 def build_dataframe_from_files(uploaded_files):
     all_records = []
     mapping_report = []
     for f in uploaded_files:
-        rows = load_raw_rows(f)
+        rows, fmts = load_raw_rows(f)
         if not rows:
             continue
         header_idx, score = find_header_row(rows)
@@ -210,6 +214,12 @@ def build_dataframe_from_files(uploaded_files):
             for col in COLUMNS:
                 idx = mapping.get(col["key"])
                 rec[col["key"]] = r[idx] if (idx is not None and idx < len(r)) else None
+            # simpan format tampilan asli sel PO Date (dipakai Versi Split Saja agar tanggal tidak berubah)
+            d_idx = mapping.get("po_date")
+            src_fmt_row = fmts[header_idx + 1 + r_i] if fmts is not None else None
+            rec["_po_date_fmt"] = (
+                src_fmt_row[d_idx] if (src_fmt_row is not None and d_idx is not None and d_idx < len(src_fmt_row)) else None
+            )
             if all(rec.get(c["key"]) in (None, "") for c in COLUMNS):
                 continue
             all_records.append(rec)
@@ -357,7 +367,7 @@ def get_template_info(template_bytes):
     }
 
 
-def build_chunk_workbook(template_bytes, template_info, chunk_df):
+def build_chunk_workbook(template_bytes, template_info, chunk_df, add_total=False, total_qty=None):
     wb = openpyxl.load_workbook(io.BytesIO(template_bytes))
     ws = wb[template_info["sheet_name"]]
     header_row = template_info["header_row_1based"]
@@ -388,7 +398,14 @@ def build_chunk_workbook(template_bytes, template_info, chunk_df):
                     cell.value = d
                     cell.number_format = "yyyy-mm-dd"
                 else:
-                    cell.value = row.get("po_date")
+                    # Versi Split Saja / tanggal tak terbaca: nilai asli + format tampilan asli dari file sumber
+                    orig = row.get("po_date")
+                    if orig is not None and not isinstance(orig, str) and pd.isna(orig):
+                        orig = None
+                    cell.value = orig
+                    src_fmt = row.get("_po_date_fmt")
+                    if isinstance(orig, (datetime, date)) and isinstance(src_fmt, str) and src_fmt:
+                        cell.number_format = src_fmt
             elif key == "qty":
                 q = row.get("_qty_norm")
                 cell.value = q if (q is not None and not pd.isna(q)) else row.get("qty")
@@ -398,6 +415,18 @@ def build_chunk_workbook(template_bytes, template_info, chunk_df):
             catatan = row.get("_catatan")
             if catatan:
                 ws.cell(row=excel_row, column=notes_col_0based + 1).value = catatan
+
+    # Baris total Qty (kolom Qty = kolom L pada template), diberi 1 baris kosong sebagai jarak dari data
+    qty_idx = mapping.get("qty")
+    if add_total and qty_idx is not None and total_qty is not None:
+        from openpyxl.styles import Font
+        total_row = header_row + len(chunk_df) + 2
+        ws.cell(row=total_row, column=qty_idx + 1).value = total_qty
+        ws.cell(row=total_row, column=qty_idx + 1).font = Font(bold=True)
+        if qty_idx >= 1:
+            lbl = ws.cell(row=total_row, column=qty_idx)
+            lbl.value = "TOTAL QTY"
+            lbl.font = Font(bold=True)
 
     bio = io.BytesIO()
     wb.save(bio)
@@ -418,6 +447,38 @@ def _text_of(value):
         if float(value).is_integer():
             return str(int(value))
     return str(value).strip()
+
+
+def _qty_number(value):
+    """Qty -> angka untuk penjumlahan; None jika kosong/bukan angka."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        if isinstance(value, str):
+            v = value.strip().replace(",", "")
+            return float(v) if v else None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sum_qty(values):
+    """Return (total, jumlah_baris_qty_bukan_angka)."""
+    total, bad = 0.0, 0
+    for v in values:
+        q = _qty_number(v)
+        if q is None:
+            bad += 1
+        else:
+            total += q
+    if float(total).is_integer():
+        total = int(total)
+    return total, bad
 
 
 def _natural_key(text):
@@ -445,7 +506,7 @@ def sort_for_dms(df):
     return df.iloc[order].reset_index(drop=True)
 
 
-def split_and_build(template_bytes, template_info, df, n_files, base_name):
+def split_and_build(template_bytes, template_info, df, n_files, base_name, add_total=True):
     """Urutkan data (Branch Code -> PO Number -> SKU Code) lalu bagi ke `n_files` file.
 
     Aturan pembagian:
@@ -527,11 +588,23 @@ def split_and_build(template_bytes, template_info, df, n_files, base_name):
                 raise RuntimeError(
                     f"Verifikasi gagal: PO Number '{_text_of(v)}' terpecah ke lebih dari satu file."
                 )
+    # --- total Qty per file & verifikasi total Qty masuk = keluar
+    qty_in, bad_in = _sum_qty(df["qty"].tolist())
+    chunk_qty = [_sum_qty(c["qty"].tolist()) for c in chunk_dfs]
+    qty_out = sum(t for t, _ in chunk_qty)
+    if abs(qty_out - qty_in) > 1e-6:
+        raise RuntimeError(f"Verifikasi gagal: total Qty masuk {qty_in} tetapi total Qty keluar {qty_out}.")
     notes.append((
         "success",
         f"Verifikasi OK: {n:,} baris masuk = {len(all_ids):,} baris keluar, "
-        f"tidak ada baris hilang/ganda, dan tidak ada PO Number yang terpecah antar file."
+        f"tidak ada baris hilang/ganda, dan tidak ada PO Number yang terpecah antar file. "
+        f"Total Qty semua file = {qty_in:,} (sama dengan data sebelum dibagi)."
     ))
+    if bad_in:
+        notes.append((
+            "warning",
+            f"{bad_in:,} baris Qty-nya kosong / bukan angka, sehingga tidak ikut dijumlahkan di total Qty."
+        ))
 
     # --- tulis file xlsx
     files = {}
@@ -539,11 +612,14 @@ def split_and_build(template_bytes, template_info, df, n_files, base_name):
     n_chunks = len(chunk_dfs)
     for c, chunk_df in enumerate(chunk_dfs):
         fname = f"{base_name}_part{c+1}of{n_chunks}.xlsx"
-        files[fname] = build_chunk_workbook(template_bytes, template_info, chunk_df)
+        files[fname] = build_chunk_workbook(
+            template_bytes, template_info, chunk_df, add_total=add_total, total_qty=chunk_qty[c][0]
+        )
         first, last = chunk_df.iloc[0], chunk_df.iloc[-1]
         plan.append({
             "file": fname,
             "jumlah_baris": len(chunk_df),
+            "total_qty": chunk_qty[c][0],
             "jumlah_PO": len({_text_of(v).casefold() for v in chunk_df["po_number"].tolist() if _text_of(v)}),
             "branch_code (awal → akhir)": f"{_text_of(first['branch_code'])} → {_text_of(last['branch_code'])}",
             "PO_number (awal → akhir)": f"{_text_of(first['po_number'])} → {_text_of(last['po_number'])}",
@@ -604,6 +680,11 @@ with st.sidebar:
         "Satu PO Number tidak akan terpecah ke file berbeda."
     )
     base_name = st.text_input("Nama dasar file output", value="ST_Data_Import")
+    add_total = st.checkbox(
+        "Tampilkan TOTAL QTY di bawah data (kolom Qty)", value=True,
+        help="Baris total ditaruh 1 baris di bawah data terakhir. Hapus baris ini sebelum upload ke DMS "
+             "agar tidak terbaca sebagai data.",
+    )
 
 st.header("3️⃣ Upload Data PO")
 data_files = st.file_uploader(
@@ -618,8 +699,8 @@ if run:
     clean_df, report = clean_and_report(df)
     template_info = get_template_info(template_bytes)
 
-    raw_files, raw_plan, raw_notes = split_and_build(template_bytes, template_info, df, int(n_files), base_name + "_RAW")
-    clean_files, clean_plan, clean_notes = split_and_build(template_bytes, template_info, clean_df, int(n_files), base_name + "_CLEAN")
+    raw_files, raw_plan, raw_notes = split_and_build(template_bytes, template_info, df, int(n_files), base_name + "_RAW", add_total)
+    clean_files, clean_plan, clean_notes = split_and_build(template_bytes, template_info, clean_df, int(n_files), base_name + "_CLEAN", add_total)
     report_bytes = build_report_workbook(report)
 
     st.session_state.result = {
