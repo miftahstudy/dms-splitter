@@ -405,13 +405,66 @@ def build_chunk_workbook(template_bytes, template_info, chunk_df):
 
 
 def split_and_build(template_bytes, template_info, df, chunk_size, base_name):
+    """Bagi data secara berurutan tanpa memisahkan PO Number yang bersebelahan.
+
+    chunk_size adalah target maksimum nominal. Titik potong digeser ke batas
+    PO terdekat (sebelum atau sesudah target) agar satu PO tetap dalam satu file.
+    """
     n = len(df)
-    n_chunks = math.ceil(n / chunk_size) if n else 0
+    if n == 0:
+        return {}, []
+
+    chunk_size = max(1, int(chunk_size))
+
+    def normalize_po(value):
+        if value is None or pd.isna(value):
+            return ""
+        # Hindari PO numerik terbaca berbeda hanya karena salah satunya float (123.0).
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if float(value).is_integer():
+                return str(int(value))
+        return str(value).strip()
+
+    po_values = [normalize_po(v) for v in df["po_number"].tolist()]
+
+    def safe_boundary(index):
+        """True jika aman memotong sebelum posisi index."""
+        if index <= 0 or index >= n:
+            return True
+        left_po = po_values[index - 1]
+        right_po = po_values[index]
+        # PO kosong tidak cukup informatif untuk dianggap satu kelompok.
+        return not left_po or not right_po or left_po != right_po
+
+    # Tentukan semua batas terlebih dahulu supaya nama file memuat total part yang benar.
+    boundaries = []
+    start = 0
+    while start < n:
+        target = min(start + chunk_size, n)
+        if target >= n:
+            end = n
+        elif safe_boundary(target):
+            end = target
+        else:
+            # Target berada di tengah satu PO. Cari batas aman terdekat,
+            # dengan urutan data tetap dipertahankan.
+            candidates = [i for i in range(start + 1, n) if safe_boundary(i)]
+            if not candidates:
+                end = n
+            else:
+                end = min(candidates, key=lambda i: (abs(i - target), i))
+        # Perlindungan agar proses selalu maju, termasuk pada data tidak biasa.
+        if end <= start:
+            end = min(start + chunk_size, n)
+            while end < n and not safe_boundary(end):
+                end += 1
+        boundaries.append((start, end))
+        start = end
+
     files = {}
     plan = []
-    for c in range(n_chunks):
-        start = c * chunk_size
-        end = min(start + chunk_size, n)
+    n_chunks = len(boundaries)
+    for c, (start, end) in enumerate(boundaries):
         chunk_df = df.iloc[start:end]
         fname = f"{base_name}_part{c+1}of{n_chunks}_rows{start+1}-{end}.xlsx"
         data_bytes = build_chunk_workbook(template_bytes, template_info, chunk_df)
