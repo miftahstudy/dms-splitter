@@ -3,6 +3,7 @@ import os
 import re
 import math
 import zipfile
+from bisect import bisect_left
 from datetime import datetime, date, timedelta
 
 import pandas as pd
@@ -404,73 +405,150 @@ def build_chunk_workbook(template_bytes, template_info, chunk_df):
     return bio.getvalue()
 
 
-def split_and_build(template_bytes, template_info, df, chunk_size, base_name):
-    """Bagi data secara berurutan tanpa memisahkan PO Number yang bersebelahan.
+def _text_of(value):
+    """Nilai sel -> teks rapi. None/NaN -> '' ; 123.0 -> '123'."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if float(value).is_integer():
+            return str(int(value))
+    return str(value).strip()
 
-    chunk_size adalah target maksimum nominal. Titik potong digeser ke batas
-    PO terdekat (sebelum atau sesudah target) agar satu PO tetap dalam satu file.
+
+def _natural_key(text):
+    """Kunci urut natural: A1 < A2 < A10, angka diurutkan sebagai angka.
+    Nilai kosong selalu diletakkan paling akhir."""
+    if text == "":
+        return (1, ())
+    parts = re.split(r"(\d+)", text.casefold())
+    return (0, tuple((0, int(p), len(p)) if p.isdigit() else (1, p, 0) for p in parts if p != ""))
+
+
+def sort_for_dms(df):
+    """Urutkan: Customer Branch Code (kol C) -> PO Number (kol G) -> Customer SKU Code (kol J).
+
+    Tidak ada baris yang dibuang; hanya urutannya yang berubah. Baris yang kuncinya
+    sama persis tetap mengikuti urutan aslinya (stabil)."""
+    branch = [_text_of(v) for v in df["branch_code"].tolist()]
+    po = [_text_of(v) for v in df["po_number"].tolist()]
+    sku = [_text_of(v) for v in df["sku_code"].tolist()]
+    keys = [
+        (_natural_key(branch[i]), _natural_key(po[i]), po[i].casefold(), _natural_key(sku[i]), i)
+        for i in range(len(df))
+    ]
+    order = sorted(range(len(df)), key=lambda i: keys[i])
+    return df.iloc[order].reset_index(drop=True)
+
+
+def split_and_build(template_bytes, template_info, df, n_files, base_name):
+    """Urutkan data (Branch Code -> PO Number -> SKU Code) lalu bagi ke `n_files` file.
+
+    Aturan pembagian:
+      * Semua baris dengan PO Number yang sama SELALU berada di file yang sama.
+      * Pembagian dibuat berurutan (file 1 berisi bagian awal data terurut, dst.) dan
+        diusahakan seimbang jumlah barisnya.
+      * Tidak ada baris yang dihapus. Setelah dibagi, jumlah & identitas setiap baris
+        diverifikasi; jika ada yang tidak cocok, proses dihentikan (bukan diam-diam lanjut).
+
+    Mengembalikan (files, plan, notes).
     """
     n = len(df)
     if n == 0:
-        return {}, []
+        return {}, [], []
 
-    chunk_size = max(1, int(chunk_size))
+    n_files = max(1, int(n_files))
+    work = df.copy().reset_index(drop=True)
+    work["_orig_idx"] = range(n)          # penanda identitas baris untuk verifikasi
+    work = sort_for_dms(work)
 
-    def normalize_po(value):
-        if value is None or pd.isna(value):
-            return ""
-        # Hindari PO numerik terbaca berbeda hanya karena salah satunya float (123.0).
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            if float(value).is_integer():
-                return str(int(value))
-        return str(value).strip()
-
-    po_values = [normalize_po(v) for v in df["po_number"].tolist()]
-
-    def safe_boundary(index):
-        """True jika aman memotong sebelum posisi index."""
-        if index <= 0 or index >= n:
-            return True
-        left_po = po_values[index - 1]
-        right_po = po_values[index]
-        # PO kosong tidak cukup informatif untuk dianggap satu kelompok.
-        return not left_po or not right_po or left_po != right_po
-
-    # Tentukan semua batas terlebih dahulu supaya nama file memuat total part yang benar.
-    boundaries = []
-    start = 0
-    while start < n:
-        target = min(start + chunk_size, n)
-        if target >= n:
-            end = n
-        elif safe_boundary(target):
-            end = target
+    # --- kelompokkan baris per PO Number (urutan kelompok = urutan kemunculan di data terurut)
+    po_norm = [_text_of(v).casefold() for v in work["po_number"].tolist()]
+    group_rows = {}
+    groups = []                           # list of list posisi baris (sudah terurut naik)
+    for pos, po in enumerate(po_norm):
+        if po == "":
+            groups.append([pos])          # PO kosong: bukan "satu PO", boleh dipisah bebas
+        elif po in group_rows:
+            group_rows[po].append(pos)
         else:
-            # Target berada di tengah satu PO. Cari batas aman terdekat,
-            # dengan urutan data tetap dipertahankan.
-            candidates = [i for i in range(start + 1, n) if safe_boundary(i)]
-            if not candidates:
-                end = n
-            else:
-                end = min(candidates, key=lambda i: (abs(i - target), i))
-        # Perlindungan agar proses selalu maju, termasuk pada data tidak biasa.
-        if end <= start:
-            end = min(start + chunk_size, n)
-            while end < n and not safe_boundary(end):
-                end += 1
-        boundaries.append((start, end))
-        start = end
+            group_rows[po] = [pos]
+            groups.append(group_rows[po])
+    groups.sort(key=lambda g: g[0])
 
+    notes = []
+    n_groups = len(groups)
+    n_eff = min(n_files, n_groups)
+    if n_eff < n_files:
+        notes.append((
+            "warning",
+            f"Permintaan {n_files} file, tetapi data hanya punya {n_groups} PO Number berbeda "
+            f"(1 PO tidak boleh dipecah), jadi hasilnya {n_eff} file."
+        ))
+
+    # --- tentukan titik potong antar kelompok supaya jumlah baris per file seimbang
+    cum = [0]
+    for g in groups:
+        cum.append(cum[-1] + len(g))
+    cuts = [0]
+    for k in range(1, n_eff):
+        ideal = n * k / n_eff
+        lo = cuts[-1] + 1                 # minimal 1 PO per file
+        hi = n_groups - (n_eff - k)       # sisakan minimal 1 PO untuk file berikutnya
+        j = bisect_left(cum, ideal)
+        cands = [min(max(c, lo), hi) for c in (j - 1, j)]
+        cuts.append(min(cands, key=lambda c: (abs(cum[c] - ideal), c)))
+    cuts.append(n_groups)
+
+    # --- bentuk DataFrame tiap file (baris di dalam file tetap urut Branch -> PO -> SKU)
+    chunk_dfs = []
+    for a, b in zip(cuts[:-1], cuts[1:]):
+        positions = sorted(p for g in groups[a:b] for p in g)
+        chunk_dfs.append(work.iloc[positions])
+
+    # --- verifikasi: tidak ada baris hilang/ganda & tidak ada PO yang terpecah antar file
+    all_ids = [i for c in chunk_dfs for i in c["_orig_idx"].tolist()]
+    if len(all_ids) != n or sorted(all_ids) != list(range(n)):
+        raise RuntimeError(
+            f"Verifikasi gagal: {n} baris masuk tetapi {len(all_ids)} baris keluar / ada baris ganda. "
+            "File tidak dibuat supaya tidak ada data yang hilang."
+        )
+    po_to_file = {}
+    for fi, c in enumerate(chunk_dfs):
+        for v in c["po_number"].tolist():
+            key = _text_of(v).casefold()
+            if key == "":
+                continue
+            if po_to_file.setdefault(key, fi) != fi:
+                raise RuntimeError(
+                    f"Verifikasi gagal: PO Number '{_text_of(v)}' terpecah ke lebih dari satu file."
+                )
+    notes.append((
+        "success",
+        f"Verifikasi OK: {n:,} baris masuk = {len(all_ids):,} baris keluar, "
+        f"tidak ada baris hilang/ganda, dan tidak ada PO Number yang terpecah antar file."
+    ))
+
+    # --- tulis file xlsx
     files = {}
     plan = []
-    n_chunks = len(boundaries)
-    for c, (start, end) in enumerate(boundaries):
-        chunk_df = df.iloc[start:end]
-        fname = f"{base_name}_part{c+1}of{n_chunks}_rows{start+1}-{end}.xlsx"
-        data_bytes = build_chunk_workbook(template_bytes, template_info, chunk_df)
-        files[fname] = data_bytes
-        plan.append({"file": fname, "jumlah_baris": end - start})
-    return files, plan
+    n_chunks = len(chunk_dfs)
+    for c, chunk_df in enumerate(chunk_dfs):
+        fname = f"{base_name}_part{c+1}of{n_chunks}.xlsx"
+        files[fname] = build_chunk_workbook(template_bytes, template_info, chunk_df)
+        first, last = chunk_df.iloc[0], chunk_df.iloc[-1]
+        plan.append({
+            "file": fname,
+            "jumlah_baris": len(chunk_df),
+            "jumlah_PO": len({_text_of(v).casefold() for v in chunk_df["po_number"].tolist() if _text_of(v)}),
+            "branch_code (awal → akhir)": f"{_text_of(first['branch_code'])} → {_text_of(last['branch_code'])}",
+            "PO_number (awal → akhir)": f"{_text_of(first['po_number'])} → {_text_of(last['po_number'])}",
+        })
+    return files, plan, notes
 
 
 def make_zip(files_dict):
@@ -485,12 +563,20 @@ def make_zip(files_dict):
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
+def show_notes(notes):
+    for level, text in notes:
+        if level == "success":
+            st.success(text)
+        else:
+            st.warning(text)
+
+
 st.set_page_config(page_title="DMS Data Splitter", page_icon="📦", layout="wide")
 st.title("📦 DMS Data Import Splitter")
 st.caption(
     "Upload data PO gabungan → Qty=0 dihapus otomatis, PO Date dirapikan ke yyyy-mm-dd, "
-    "baris bermasalah lain tetap dicantumkan dengan catatan → dibagi menjadi beberapa file "
-    "xlsx sesuai batas maksimum baris DMS. Tidak ada langkah edit manual."
+    "baris bermasalah lain tetap dicantumkan dengan catatan → diurutkan (Branch Code → PO Number → SKU Code) "
+    "lalu dibagi sesuai jumlah file yang dipilih, 1 PO Number selalu utuh dalam 1 file. Tidak ada langkah edit manual."
 )
 
 for key in ("result", ):
@@ -511,8 +597,12 @@ with st.sidebar:
         template_bytes = None
         st.warning("Belum ada template. Silakan upload template resmi.")
 
-    st.header("2️⃣ Ukuran per file")
-    chunk_size = st.number_input("Maksimum baris per file", min_value=1, value=6000, step=100)
+    st.header("2️⃣ Jumlah file")
+    n_files = st.number_input("Mau dibagi jadi berapa file?", min_value=1, value=2, step=1)
+    st.caption(
+        "Data diurutkan: Customer Branch Code → PO Number → Customer SKU Code. "
+        "Satu PO Number tidak akan terpecah ke file berbeda."
+    )
     base_name = st.text_input("Nama dasar file output", value="ST_Data_Import")
 
 st.header("3️⃣ Upload Data PO")
@@ -528,21 +618,29 @@ if run:
     clean_df, report = clean_and_report(df)
     template_info = get_template_info(template_bytes)
 
-    raw_files, raw_plan = split_and_build(template_bytes, template_info, df, int(chunk_size), base_name + "_RAW")
-    clean_files, clean_plan = split_and_build(template_bytes, template_info, clean_df, int(chunk_size), base_name + "_CLEAN")
+    raw_files, raw_plan, raw_notes = split_and_build(template_bytes, template_info, df, int(n_files), base_name + "_RAW")
+    clean_files, clean_plan, clean_notes = split_and_build(template_bytes, template_info, clean_df, int(n_files), base_name + "_CLEAN")
     report_bytes = build_report_workbook(report)
 
     st.session_state.result = {
         "mapping_report": mapping_report,
         "report": report,
-        "raw_files": raw_files, "raw_plan": raw_plan,
-        "clean_files": clean_files, "clean_plan": clean_plan,
+        "raw_files": raw_files, "raw_plan": raw_plan, "raw_notes": raw_notes,
+        "clean_files": clean_files, "clean_plan": clean_plan, "clean_notes": clean_notes,
         "report_bytes": report_bytes,
     }
 
 result = st.session_state.result
 if result:
     report = result["report"]
+
+    for rep in result["mapping_report"]:
+        missing_keys = [LABEL_BY_KEY[k] for k in ("branch_code", "po_number", "sku_code") if k not in rep["mapping"]]
+        if missing_keys:
+            st.warning(
+                f"File **{rep['file']}**: kolom {', '.join(missing_keys)} tidak ditemukan di header, "
+                "sehingga pengurutan/pengelompokan PO untuk kolom itu tidak akurat. Cek nama header kolomnya."
+            )
 
     with st.expander("🔎 Cek pemetaan kolom (otomatis)", expanded=False):
         for rep in result["mapping_report"]:
@@ -600,6 +698,7 @@ if result:
         st.subheader("Versi 1: Split Saja (data asli, tanpa dibersihkan)")
         st.caption("Data original langsung dibagi ke template, tidak ada baris yang dihapus/diubah.")
         st.dataframe(pd.DataFrame(result["raw_plan"]), hide_index=True, use_container_width=True)
+        show_notes(result["raw_notes"])
         st.download_button(
             "⬇️ Download Versi Split Saja (ZIP)",
             data=make_zip(result["raw_files"]),
@@ -613,6 +712,7 @@ if result:
         st.subheader("Versi 2: Sudah Dibersihkan + Split")
         st.caption("Qty=0 sudah dihapus. Baris lain yang bermasalah tetap ada, plus kolom Catatan Validasi & PO Date dirapikan ke yyyy-mm-dd bila terbaca.")
         st.dataframe(pd.DataFrame(result["clean_plan"]), hide_index=True, use_container_width=True)
+        show_notes(result["clean_notes"])
         st.download_button(
             "⬇️ Download Versi Sudah Dibersihkan (ZIP)",
             data=make_zip(result["clean_files"]),
